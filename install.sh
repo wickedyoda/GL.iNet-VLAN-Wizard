@@ -43,6 +43,43 @@ fi
 
 info "Mode: $MODE"
 
+# --- MODEL DETECT ---
+MODEL_NAME="$(ubus call system board 2>/dev/null | grep -o '"model": *"[^"]*"' | sed 's/"model": *"//;s/"$//' || true)"
+BOARD_NAME="$(cat /etc/board.json 2>/dev/null | grep -o '"id": *"[^"]*"' | sed 's/"id": *"//;s/"$//' || true)"
+
+if [ "$MODE" = "swconfig" ]; then
+    DEFAULT_TRUNK_PORT="4"
+    DEFAULT_LAN_PORTS="1 2 3 4"
+else
+    DEFAULT_TRUNK_PORT="4"
+    DEFAULT_LAN_PORTS=""
+fi
+
+case "$BOARD_NAME" in
+    glinet,gl-be14000)
+        MODEL_FAMILY="GL-BE14000"
+        DEFAULT_TRUNK_PORT="6"
+        ;;
+    glinet,gl-mt6000)
+        MODEL_FAMILY="GL-MT6000"
+        ;;
+    qcom,ipq5332-ap-mi01.2)
+        MODEL_FAMILY="GL-BE6500"
+        ;;
+    qcom,ipq5332-ap-mi04.1-c2)
+        MODEL_FAMILY="BE3600"
+        ;;
+    glinet,gl-be10000)
+        MODEL_FAMILY="GL-BE10000"
+        ;;
+    *)
+        MODEL_FAMILY="unknown"
+        ;;
+esac
+
+info "Model: ${MODEL_FAMILY:-unknown}"
+info "Board: ${BOARD_NAME:-unknown}"
+
 # --- WAN DETECT (DUAL-WAN SAFE) ---
 WAN_IFACES=""
 for net in wan wan6 wwan wan2; do
@@ -62,14 +99,28 @@ fi
 
 # --- PORT DETECT ---
 if [ "$MODE" = "dsa" ]; then
-    LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sort || true)"
+    if [ "$MODEL_FAMILY" = "GL-BE14000" ]; then
+        LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sort || true)"
+    else
+        LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sort || true)"
+    fi
 else
     LAN_PORTS="1 2 3 4"
 fi
 
-info "Available LAN ports: $LAN_PORTS"
+info "Available LAN ports: ${LAN_PORTS:-${DEFAULT_LAN_PORTS}}"
 
-TRUNK_PORT="4"
+if [ -n "${LAN_PORTS}" ]; then
+    TRUNK_PORT="$(echo "$LAN_PORTS" | tail -n 1 | sed 's/lan//' || true)"
+else
+    TRUNK_PORT="$DEFAULT_TRUNK_PORT"
+fi
+
+if [ "$MODEL_FAMILY" = "GL-BE14000" ]; then
+    info "BE14000 detected: using lan6 as default trunk"
+elif [ "$MODE" = "swconfig" ]; then
+    info "swconfig detected: using port $TRUNK_PORT as default trunk"
+fi
 
 echo
 printf "Load profile? (name or blank): "
