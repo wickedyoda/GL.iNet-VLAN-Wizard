@@ -80,6 +80,56 @@ esac
 info "Model: ${MODEL_FAMILY:-unknown}"
 info "Board: ${BOARD_NAME:-unknown}"
 
+# --- PHYSICAL PORT MAP (per model / wiki) ---
+# Used by validation and trunk detection to enforce real hardware limits.
+case "$MODEL_FAMILY" in
+    GL-BE14000)
+        MAX_PHYSICAL_PORT=6
+        KNOWN_LAN_PORTS="lan1 lan2 lan3 lan4 lan5 lan6"
+        ;;
+    GL-MT6000)
+        MAX_PHYSICAL_PORT=5
+        KNOWN_LAN_PORTS="1 2 3 4 5"
+        ;;
+    GL-BE6500)
+        MAX_PHYSICAL_PORT=4
+        KNOWN_LAN_PORTS="lan1 lan2 lan3 lan4"
+        ;;
+    BE3600)
+        MAX_PHYSICAL_PORT=4
+        KNOWN_LAN_PORTS="lan1 lan2 lan3 lan4"
+        ;;
+    GL-BE10000)
+        MAX_PHYSICAL_PORT=4
+        KNOWN_LAN_PORTS="lan1 lan2 lan3 lan4"
+        ;;
+    *)
+        MAX_PHYSICAL_PORT=""
+        KNOWN_LAN_PORTS=""
+        ;;
+esac
+
+if [ -n "$MAX_PHYSICAL_PORT" ]; then
+    info "Physical LAN ports: $MAX_PHYSICAL_PORT ($KNOWN_LAN_PORTS)"
+fi
+
+# --- OS VERSION DETECT ---
+OPENWRT_VERSION=""
+OPENWRT_RELEASE=""
+if [ -f /etc/openwrt_release ]; then
+    OPENWRT_VERSION="$(grep -o 'DISTRIB_VERSION="[^"]*"' /etc/openwrt_release | cut -d'"' -f2 || true)"
+    OPENWRT_RELEASE="$(grep -o 'DISTRIB_RELEASE="[^"]*"' /etc/openwrt_release | cut -d'"' -f2 || true)"
+fi
+info "OpenWrt: ${OPENWRT_VERSION:-unknown} (${OPENWRT_RELEASE:-unknown})"
+
+# Set a flag for 21.02-era behavior
+OPENWRT_LEGACY="0"
+case "$OPENWRT_VERSION" in
+    21.02*|19.07*|22.03*)
+        OPENWRT_LEGACY="1"
+        ;;
+esac
+
 # --- WAN DETECT (DUAL-WAN SAFE) ---
 WAN_IFACES=""
 for net in wan wan6 wwan wan2; do
@@ -98,21 +148,47 @@ else
 fi
 
 # --- PORT DETECT ---
-if [ "$MODE" = "dsa" ]; then
-    if [ "$MODEL_FAMILY" = "GL-BE14000" ]; then
-        LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sort || true)"
+# Prefer the wiki-derived physical port map when available;
+# fall back to /sys/class/net for unknown models.
+if [ -n "$KNOWN_LAN_PORTS" ]; then
+    if [ "$MODE" = "swconfig" ]; then
+        # KNOWN_LAN_PORTS for swconfig is numeric ("1 2 3 4 5")
+        LAN_PORTS="$KNOWN_LAN_PORTS"
     else
-        LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sort || true)"
+        LAN_PORTS="$KNOWN_LAN_PORTS"
     fi
 else
-    LAN_PORTS="1 2 3 4"
+    if [ "$MODE" = "dsa" ]; then
+        LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sort || true)"
+    else
+        LAN_PORTS="1 2 3 4"
+    fi
 fi
 
 info "Available LAN ports: ${LAN_PORTS:-${DEFAULT_LAN_PORTS}}"
 
-if [ -n "${LAN_PORTS}" ]; then
-    TRUNK_PORT="$(echo "$LAN_PORTS" | tail -n 1 | sed 's/lan//' || true)"
+# Default trunk: highest-numbered physical port (common convention),
+# but never exceed the known physical port count.
+if [ "$MODE" = "dsa" ]; then
+    TRUNK_PORT="$(echo "$LAN_PORTS" | tr ' ' '\n' | grep -E '^lan[0-9]+$' | sed 's/lan//' | sort -n | tail -n 1 || true)"
 else
+    TRUNK_PORT="$(echo "$LAN_PORTS" | tr ' ' '\n' | sort -n | tail -n 1 || true)"
+fi
+
+if [ -n "$MAX_PHYSICAL_PORT" ]; then
+    case "$TRUNK_PORT" in
+        ''|*[!0-9]*)
+            TRUNK_PORT="$DEFAULT_TRUNK_PORT"
+            ;;
+        *)
+            if [ "$TRUNK_PORT" -gt "$MAX_PHYSICAL_PORT" ] 2>/dev/null; then
+                TRUNK_PORT="$MAX_PHYSICAL_PORT"
+            fi
+            ;;
+    esac
+fi
+
+if [ -z "${TRUNK_PORT:-}" ]; then
     TRUNK_PORT="$DEFAULT_TRUNK_PORT"
 fi
 
@@ -120,6 +196,8 @@ if [ "$MODEL_FAMILY" = "GL-BE14000" ]; then
     info "BE14000 detected: using lan6 as default trunk"
 elif [ "$MODE" = "swconfig" ]; then
     info "swconfig detected: using port $TRUNK_PORT as default trunk"
+elif [ -n "$MAX_PHYSICAL_PORT" ]; then
+    info "Default trunk: port $TRUNK_PORT"
 fi
 
 echo
@@ -167,7 +245,7 @@ else
             ISO="n"
         fi
 
-        printf "Untagged ports (exclude WAN + 4): "
+        printf "Untagged ports (exclude WAN + %s): " "$TRUNK_PORT"
         read UNTAG
         UNTAG="$(trim_spaces "$UNTAG")"
 
@@ -277,6 +355,19 @@ for entry in $(echo "$CONFIGS" | tr '|' ' '); do
                 fi
             fi
 
+            # Physical port limit (from wiki model data)
+            if [ -n "$MAX_PHYSICAL_PORT" ]; then
+                case "$p" in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        if [ "$p" -gt "$MAX_PHYSICAL_PORT" ] 2>/dev/null; then
+                            warn "VLAN $v references port $p which exceeds physical port count ($MAX_PHYSICAL_PORT)"
+                            ERRORS=$((ERRORS+1))
+                        fi
+                        ;;
+                esac
+            fi
+
             # WAN safety
             if [ "$MODE" = "dsa" ]; then
                 if contains_word "lan$p" $WAN_IFACES; then
@@ -356,7 +447,7 @@ for entry in $(echo "$CONFIGS" | tr '|' ' '); do
     echo "VLAN $v"
     echo "  Subnet: 192.168.$v.0/24"
     echo "  Gateway: 192.168.$v.1"
-    echo "  Trunk: LAN4 (tagged)"
+    echo "  Trunk: ${TRUNK_PORT} (tagged)"
     echo "  Untagged: ${UNTAG:-none}"
     echo "  SSID: ${SSID:-none}"
     echo "  Isolation: $ISO"
@@ -472,6 +563,47 @@ else
 
         v="$(echo "$entry" | cut -d';' -f1)"
         UNTAG="$(echo "$entry" | cut -d';' -f4)"
+
+        # --- BE6500 23.05 / IPQ53xx: also configure switch1 explicitly ---
+        # The BE6500 exposes a non-standard switch1 (ports 4 5 6 7 3t)
+        # where port 3 is tagged toward eth1. DSA bridge-vlan alone may
+        # not fully program this switch on 23.05, so we write both
+        # switch_vlan and bridge-vlan configs for this model.
+        if [ "$MODEL_FAMILY" = "GL-BE6500" ]; then
+            info "BE6500 detected: writing switch1 hardware VLAN $v"
+
+            # Map DSA port numbers to BE6500 switch1 ports:
+            #   lan1 -> 4, lan2 -> 5, lan3 -> 6, lan4 -> 7
+            # CPU/tagged uplink is port 3
+            SWITCH_PORTS="3t"
+
+            for p in $UNTAG; do
+                [ "$p" = "$TRUNK_PORT" ] && continue
+                case "$p" in
+                    1) SWITCH_PORTS="$SWITCH_PORTS 4u" ;;
+                    2) SWITCH_PORTS="$SWITCH_PORTS 5u" ;;
+                    3) SWITCH_PORTS="$SWITCH_PORTS 6u" ;;
+                    4) SWITCH_PORTS="$SWITCH_PORTS 7u" ;;
+                    *) SWITCH_PORTS="$SWITCH_PORTS ${p}u" ;;
+                esac
+            done
+
+            if [ -n "$TRUNK_PORT" ]; then
+                case "$TRUNK_PORT" in
+                    1) SWITCH_PORTS="$SWITCH_PORTS 4t" ;;
+                    2) SWITCH_PORTS="$SWITCH_PORTS 5t" ;;
+                    3) SWITCH_PORTS="$SWITCH_PORTS 6t" ;;
+                    4) SWITCH_PORTS="$SWITCH_PORTS 7t" ;;
+                    *) SWITCH_PORTS="$SWITCH_PORTS ${TRUNK_PORT}t" ;;
+                esac
+            fi
+
+            uci add network switch_vlan >/dev/null
+            uci set network.@switch_vlan[-1].device='switch1'
+            uci set network.@switch_vlan[-1].vlan="$v"
+            uci set network.@switch_vlan[-1].ports="$SWITCH_PORTS"
+        fi
+        # --- end BE6500 switch_vlan ---
 
         uci add network bridge-vlan >/dev/null
         uci set network.@bridge-vlan[-1].device='br-lan'
