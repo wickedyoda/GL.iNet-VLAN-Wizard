@@ -80,6 +80,23 @@ esac
 info "Model: ${MODEL_FAMILY:-unknown}"
 info "Board: ${BOARD_NAME:-unknown}"
 
+# --- OS VERSION DETECT ---
+OPENWRT_VERSION=""
+OPENWRT_RELEASE=""
+if [ -f /etc/openwrt_release ]; then
+    OPENWRT_VERSION="$(grep -o 'DISTRIB_VERSION="[^"]*"' /etc/openwrt_release | cut -d'"' -f2 || true)"
+    OPENWRT_RELEASE="$(grep -o 'DISTRIB_RELEASE="[^"]*"' /etc/openwrt_release | cut -d'"' -f2 || true)"
+fi
+info "OpenWrt: ${OPENWRT_VERSION:-unknown} (${OPENWRT_RELEASE:-unknown})"
+
+# Set a flag for 21.02-era behavior
+OPENWRT_LEGACY="0"
+case "$OPENWRT_VERSION" in
+    21.02*|19.07*|22.03*)
+        OPENWRT_LEGACY="1"
+        ;;
+esac
+
 # --- WAN DETECT (DUAL-WAN SAFE) ---
 WAN_IFACES=""
 for net in wan wan6 wwan wan2; do
@@ -472,6 +489,47 @@ else
 
         v="$(echo "$entry" | cut -d';' -f1)"
         UNTAG="$(echo "$entry" | cut -d';' -f4)"
+
+        # --- BE6500 23.05 / IPQ53xx: also configure switch1 explicitly ---
+        # The BE6500 exposes a non-standard switch1 (ports 4 5 6 7 3t)
+        # where port 3 is tagged toward eth1. DSA bridge-vlan alone may
+        # not fully program this switch on 23.05, so we write both
+        # switch_vlan and bridge-vlan configs for this model.
+        if [ "$MODEL_FAMILY" = "GL-BE6500" ]; then
+            info "BE6500 detected: writing switch1 hardware VLAN $v"
+
+            # Map DSA port numbers to BE6500 switch1 ports:
+            #   lan1 -> 4, lan2 -> 5, lan3 -> 6, lan4 -> 7
+            # CPU/tagged uplink is port 3
+            SWITCH_PORTS="3t"
+
+            for p in $UNTAG; do
+                [ "$p" = "$TRUNK_PORT" ] && continue
+                case "$p" in
+                    1) SWITCH_PORTS="$SWITCH_PORTS 4u" ;;
+                    2) SWITCH_PORTS="$SWITCH_PORTS 5u" ;;
+                    3) SWITCH_PORTS="$SWITCH_PORTS 6u" ;;
+                    4) SWITCH_PORTS="$SWITCH_PORTS 7u" ;;
+                    *) SWITCH_PORTS="$SWITCH_PORTS ${p}u" ;;
+                esac
+            done
+
+            if [ -n "$TRUNK_PORT" ]; then
+                case "$TRUNK_PORT" in
+                    1) SWITCH_PORTS="$SWITCH_PORTS 4t" ;;
+                    2) SWITCH_PORTS="$SWITCH_PORTS 5t" ;;
+                    3) SWITCH_PORTS="$SWITCH_PORTS 6t" ;;
+                    4) SWITCH_PORTS="$SWITCH_PORTS 7t" ;;
+                    *) SWITCH_PORTS="$SWITCH_PORTS ${TRUNK_PORT}t" ;;
+                esac
+            fi
+
+            uci add network switch_vlan >/dev/null
+            uci set network.@switch_vlan[-1].device='switch1'
+            uci set network.@switch_vlan[-1].vlan="$v"
+            uci set network.@switch_vlan[-1].ports="$SWITCH_PORTS"
+        fi
+        # --- end BE6500 switch_vlan ---
 
         uci add network bridge-vlan >/dev/null
         uci set network.@bridge-vlan[-1].device='br-lan'
