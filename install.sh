@@ -80,6 +80,39 @@ esac
 info "Model: ${MODEL_FAMILY:-unknown}"
 info "Board: ${BOARD_NAME:-unknown}"
 
+# --- PHYSICAL PORT MAP (per model / wiki) ---
+# Used by validation and trunk detection to enforce real hardware limits.
+case "$MODEL_FAMILY" in
+    GL-BE14000)
+        MAX_PHYSICAL_PORT=6
+        KNOWN_LAN_PORTS="lan1 lan2 lan3 lan4 lan5 lan6"
+        ;;
+    GL-MT6000)
+        MAX_PHYSICAL_PORT=5
+        KNOWN_LAN_PORTS="1 2 3 4 5"
+        ;;
+    GL-BE6500)
+        MAX_PHYSICAL_PORT=4
+        KNOWN_LAN_PORTS="lan1 lan2 lan3 lan4"
+        ;;
+    BE3600)
+        MAX_PHYSICAL_PORT=4
+        KNOWN_LAN_PORTS="lan1 lan2 lan3 lan4"
+        ;;
+    GL-BE10000)
+        MAX_PHYSICAL_PORT=4
+        KNOWN_LAN_PORTS="lan1 lan2 lan3 lan4"
+        ;;
+    *)
+        MAX_PHYSICAL_PORT=""
+        KNOWN_LAN_PORTS=""
+        ;;
+esac
+
+if [ -n "$MAX_PHYSICAL_PORT" ]; then
+    info "Physical LAN ports: $MAX_PHYSICAL_PORT ($KNOWN_LAN_PORTS)"
+fi
+
 # --- OS VERSION DETECT ---
 OPENWRT_VERSION=""
 OPENWRT_RELEASE=""
@@ -115,21 +148,47 @@ else
 fi
 
 # --- PORT DETECT ---
-if [ "$MODE" = "dsa" ]; then
-    if [ "$MODEL_FAMILY" = "GL-BE14000" ]; then
-        LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sort || true)"
+# Prefer the wiki-derived physical port map when available;
+# fall back to /sys/class/net for unknown models.
+if [ -n "$KNOWN_LAN_PORTS" ]; then
+    if [ "$MODE" = "swconfig" ]; then
+        # KNOWN_LAN_PORTS for swconfig is numeric ("1 2 3 4 5")
+        LAN_PORTS="$KNOWN_LAN_PORTS"
     else
-        LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sort || true)"
+        LAN_PORTS="$KNOWN_LAN_PORTS"
     fi
 else
-    LAN_PORTS="1 2 3 4"
+    if [ "$MODE" = "dsa" ]; then
+        LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sort || true)"
+    else
+        LAN_PORTS="1 2 3 4"
+    fi
 fi
 
 info "Available LAN ports: ${LAN_PORTS:-${DEFAULT_LAN_PORTS}}"
 
-if [ -n "${LAN_PORTS}" ]; then
-    TRUNK_PORT="$(echo "$LAN_PORTS" | tail -n 1 | sed 's/lan//' || true)"
+# Default trunk: highest-numbered physical port (common convention),
+# but never exceed the known physical port count.
+if [ "$MODE" = "dsa" ]; then
+    TRUNK_PORT="$(echo "$LAN_PORTS" | tr ' ' '\n' | grep -E '^lan[0-9]+$' | sed 's/lan//' | sort -n | tail -n 1 || true)"
 else
+    TRUNK_PORT="$(echo "$LAN_PORTS" | tr ' ' '\n' | sort -n | tail -n 1 || true)"
+fi
+
+if [ -n "$MAX_PHYSICAL_PORT" ]; then
+    case "$TRUNK_PORT" in
+        ''|*[!0-9]*)
+            TRUNK_PORT="$DEFAULT_TRUNK_PORT"
+            ;;
+        *)
+            if [ "$TRUNK_PORT" -gt "$MAX_PHYSICAL_PORT" ] 2>/dev/null; then
+                TRUNK_PORT="$MAX_PHYSICAL_PORT"
+            fi
+            ;;
+    esac
+fi
+
+if [ -z "${TRUNK_PORT:-}" ]; then
     TRUNK_PORT="$DEFAULT_TRUNK_PORT"
 fi
 
@@ -137,6 +196,8 @@ if [ "$MODEL_FAMILY" = "GL-BE14000" ]; then
     info "BE14000 detected: using lan6 as default trunk"
 elif [ "$MODE" = "swconfig" ]; then
     info "swconfig detected: using port $TRUNK_PORT as default trunk"
+elif [ -n "$MAX_PHYSICAL_PORT" ]; then
+    info "Default trunk: port $TRUNK_PORT"
 fi
 
 echo
@@ -184,7 +245,7 @@ else
             ISO="n"
         fi
 
-        printf "Untagged ports (exclude WAN + 4): "
+        printf "Untagged ports (exclude WAN + %s): " "$TRUNK_PORT"
         read UNTAG
         UNTAG="$(trim_spaces "$UNTAG")"
 
@@ -294,6 +355,19 @@ for entry in $(echo "$CONFIGS" | tr '|' ' '); do
                 fi
             fi
 
+            # Physical port limit (from wiki model data)
+            if [ -n "$MAX_PHYSICAL_PORT" ]; then
+                case "$p" in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        if [ "$p" -gt "$MAX_PHYSICAL_PORT" ] 2>/dev/null; then
+                            warn "VLAN $v references port $p which exceeds physical port count ($MAX_PHYSICAL_PORT)"
+                            ERRORS=$((ERRORS+1))
+                        fi
+                        ;;
+                esac
+            fi
+
             # WAN safety
             if [ "$MODE" = "dsa" ]; then
                 if contains_word "lan$p" $WAN_IFACES; then
@@ -373,7 +447,7 @@ for entry in $(echo "$CONFIGS" | tr '|' ' '); do
     echo "VLAN $v"
     echo "  Subnet: 192.168.$v.0/24"
     echo "  Gateway: 192.168.$v.1"
-    echo "  Trunk: LAN4 (tagged)"
+    echo "  Trunk: ${TRUNK_PORT} (tagged)"
     echo "  Untagged: ${UNTAG:-none}"
     echo "  SSID: ${SSID:-none}"
     echo "  Isolation: $ISO"
