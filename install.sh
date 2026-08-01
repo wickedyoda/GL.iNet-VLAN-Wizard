@@ -4,7 +4,6 @@
 # - Dual-WAN aware
 # - Multi-radio Wi-Fi
 # - Profiles
-# - LAN4 forced trunk
 # - Rollback safety
 # - Subnet conflict detection
 # - Warning if no untagged/access ports are assigned anywhere
@@ -12,7 +11,7 @@
 # Notes:
 # - Supports swconfig and DSA-style configs
 # - Assumes per-VLAN subnet 192.168.<VLAN>.0/24
-# - LAN4 is always the tagged trunk port
+# - Trunk port defaults to highest physical LAN port per model
 # - Does NOT enforce a management VLAN
 
 set -e
@@ -121,14 +120,6 @@ if [ -f /etc/openwrt_release ]; then
     OPENWRT_RELEASE="$(grep -o 'DISTRIB_RELEASE="[^"]*"' /etc/openwrt_release | cut -d'"' -f2 || true)"
 fi
 info "OpenWrt: ${OPENWRT_VERSION:-unknown} (${OPENWRT_RELEASE:-unknown})"
-
-# Set a flag for 21.02-era behavior
-OPENWRT_LEGACY="0"
-case "$OPENWRT_VERSION" in
-    21.02*|19.07*|22.03*)
-        OPENWRT_LEGACY="1"
-        ;;
-esac
 
 # --- WAN DETECT (DUAL-WAN SAFE) ---
 WAN_IFACES=""
